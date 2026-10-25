@@ -85,35 +85,51 @@ __global__ void fa1_kernel(const T* __restrict__ Q, const T* __restrict__ K,
         const float l_old = l_bh[row];   // 0    before the first K/V tile
         float* o_row = o_bh + (size_t)row * D;  // FP32, zero-initialised
 
-        // ================= TODO(Cassie): FA v1 core =================
-        // Available:
-        //   Qs[tx * D + d]   this thread's query row           (d < D)
-        //   Ks[c * D + d]    key   c of the tile               (c < BC)
-        //   Vs[c * D + d]    value c of the tile
-        //   kv0 + c >= N  ->  key c is padding, its score must be -INFINITY
-        //   m_old, l_old, o_row[d]  the running state (o_row is already
-        //                            normalised by l_old — that's v1)
-        //   scale
-        //
-        // Compute (paper Algorithm 1, lines 9-12; same symbols as
-        // flash_pytorch.py except v1 keeps O normalised):
-        //   s[c]    = scale * dot(Q_row, K_c)          float s[BC] in registers
-        //   m_tilde = max_c s[c]
-        //   p[c]    = exp(s[c] - m_tilde),  l_tilde = sum_c p[c]
-        //   m_new   = max(m_old, m_tilde)
-        //   l_new   = exp(m_old - m_new) * l_old + exp(m_tilde - m_new) * l_tilde
-        //   o_row[d] = ( l_old * exp(m_old - m_new) * o_row[d]
-        //              + exp(m_tilde - m_new) * sum_c p[c] * Vs[c][d] ) / l_new
-        //   m_bh[row] = m_new;  l_bh[row] = l_new;
-        //
-        // Hints: loops over c with a compile-time bound (BC) can be
-        // `#pragma unroll`ed so s[] stays in registers. Write o_row directly
-        // (it's global memory — that read/write is exactly v1's cost).
-        (void)m_old;
-        (void)l_old;
-        (void)o_row;
-        (void)scale;
-        // =============================================================
+        // ---- FA v1 core: paper Algorithm 1, lines 9-13 ----
+        // (1) S_ij row: s[c] = scale * <Q_row, K_c>, padding keys -> -inf.
+        //     c-loops are fully unrolled so s[c] has compile-time indices and
+        //     lives in registers (a runtime index would push s[] to local mem).
+        float s[BC];
+        float m_tilde = -INFINITY;
+#pragma unroll
+        for (int c = 0; c < BC; ++c) {
+          float acc = 0.f;
+#pragma unroll 8
+          for (int d = 0; d < D; ++d) acc += Qs[tx * D + d] * Ks[c * D + d];
+          s[c] = (kv0 + c < N) ? acc * scale : -INFINITY;
+          m_tilde = fmaxf(m_tilde, s[c]);
+        }
+        // m_tilde is finite: every tile has at least one real key (kv0 < N).
+
+        // (2) Tile-local softmax numerator and denominator.
+        //     exp(-inf - m_tilde) = 0, so padding keys drop out by themselves.
+        float l_tilde = 0.f;
+#pragma unroll
+        for (int c = 0; c < BC; ++c) {
+          s[c] = expf(s[c] - m_tilde);  // s[] now holds P~_ij
+          l_tilde += s[c];
+        }
+
+        // (3) Merge with the running state. On the first K/V tile
+        //     m_old = -inf, l_old = 0 -> exp(m_old - m_new) = 0, the old
+        //     term vanishes (o_row is zero-initialised, so 0 * o is not NaN).
+        const float m_new = fmaxf(m_old, m_tilde);
+        const float w_old = l_old * expf(m_old - m_new);  // weight of old O
+        const float w_new = expf(m_tilde - m_new);        // weight of this tile
+        const float l_new = w_old + w_new * l_tilde;
+        const float inv_l_new = 1.f / l_new;
+
+        // (4) O_i = (w_old * O_i + w_new * P~_ij V_j) / l_new.
+        //     o_row is in HBM: one read + one write per element per (i, j)
+        //     pair — this is the traffic v2 removes.
+        for (int d = 0; d < D; ++d) {
+          float pv = 0.f;
+#pragma unroll
+          for (int c = 0; c < BC; ++c) pv += s[c] * Vs[c * D + d];
+          o_row[d] = (w_old * o_row[d] + w_new * pv) * inv_l_new;
+        }
+        m_bh[row] = m_new;
+        l_bh[row] = l_new;
       }
       __syncthreads();  // Qs is overwritten by the next Q tile
     }

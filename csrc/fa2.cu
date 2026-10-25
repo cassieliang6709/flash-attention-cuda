@@ -79,29 +79,54 @@ __global__ void fa2_kernel(const T* __restrict__ Q, const T* __restrict__ K,
     __syncthreads();
 
     if (row < N) {
-      // ================= TODO(Cassie): FA v2 inner loop =================
-      // Available: Qs[tx * D + d], Ks[c * D + d], Vs[c * D + d], scale,
-      //            kv0 + c >= N -> key c is padding (score = -INFINITY),
-      //            running state o[D], m, l (o is NOT normalised).
-      //
-      // Exactly the body of the j-loop in flash_pytorch.py:
-      //   s[c]  = scale * dot(Q_row, K_c)
-      //   m_new = max(m, max_c s[c])
-      //   p[c]  = exp(s[c] - m_new)
-      //   alpha = exp(m - m_new)
-      //   l     = alpha * l + sum_c p[c]
-      //   o[d]  = alpha * o[d] + sum_c p[c] * Vs[c][d]
-      //   m     = m_new
-      // ===================================================================
+      // ---- FA v2 inner loop: the j-loop body of flash_pytorch.py ----
+      // (1) Scores for this K/V tile, padding keys -> -inf.
+      float s[BC];
+      float m_tile = -INFINITY;
+#pragma unroll
+      for (int c = 0; c < BC; ++c) {
+        float acc = 0.f;
+#pragma unroll 8
+        for (int d = 0; d < D; ++d) acc += Qs[tx * D + d] * Ks[c * D + d];
+        s[c] = (kv0 + c < N) ? acc * scale : -INFINITY;
+        m_tile = fmaxf(m_tile, s[c]);
+      }
+
+      // (2) New running max, and the factor that rescales everything
+      //     accumulated so far. First tile: m = -inf -> alpha = 0.
+      const float m_new = fmaxf(m, m_tile);
+      const float alpha = expf(m - m_new);
+
+      // (3) Unnormalised probabilities against the NEW max (unlike v1,
+      //     which exponentiates against the tile max and fixes it up later).
+      float row_sum = 0.f;
+#pragma unroll
+      for (int c = 0; c < BC; ++c) {
+        s[c] = expf(s[c] - m_new);  // s[] now holds P~
+        row_sum += s[c];
+      }
+      l = alpha * l + row_sum;
+
+      // (4) o = alpha * o + P~ V. Both loops unrolled: o[d] and s[c] need
+      //     compile-time indices to stay in registers. No division by l here
+      //     — that happens once, after the last tile.
+#pragma unroll
+      for (int d = 0; d < D; ++d) {
+        float pv = 0.f;
+#pragma unroll
+        for (int c = 0; c < BC; ++c) pv += s[c] * Vs[c * D + d];
+        o[d] = alpha * o[d] + pv;
+      }
+      m = m_new;
     }
   }
 
   if (row < N) {
-    // ================= TODO(Cassie): finalise =================
-    // O[bh, row, d] = o[d] / l   (convert with from_float<T>)
-    // ===========================================================
-    (void)O;
-    (void)scale;
+    // Finalise: the single normalisation and the single HBM write of O.
+    const float inv_l = 1.f / l;
+    T* o_out = O + ((size_t)bh * N + row) * D;
+#pragma unroll
+    for (int d = 0; d < D; ++d) o_out[d] = from_float<T>(o[d] * inv_l);
   }
 }
 
