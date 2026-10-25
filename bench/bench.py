@@ -7,6 +7,10 @@ Timing: CUDA events around each call, after warmup; L2 is flushed before
 every timed call (writes a 256 MB buffer) so K/V never start out hot in L2
 from the previous iteration. We report the median and the 20th/80th percentile.
 
+Memory: extra_mem_MiB = peak allocated during one call minus what was
+allocated just before it (q, k, v and the L2-flush buffer), i.e. the output
+O plus any workspace (naive's [B*H, N, N] S matrix, fa1's fp32 O/l/m).
+
 TFLOP/s counts the two matmuls only: 4 * B * H * N^2 * D (non-causal),
 the same convention as the FlashAttention papers. Softmax exps are not counted.
 """
@@ -42,14 +46,19 @@ def flush_l2():
 
 
 def time_ms(fn, warmup, iters):
-    # Slow configs (e.g. fa1 at N=16k is a single sequential loop per head)
-    # would take minutes at full iteration count; probe once and back off.
+    # The first (probe) call also measures memory. Slow configs (e.g. fa1 at
+    # N=16k is a single sequential loop per head) would take minutes at full
+    # iteration count, so if the probe is slow we back off.
+    flush_l2()
     torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
     fn()
     end.record()
     torch.cuda.synchronize()
+    extra_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
     if start.elapsed_time(end) > 1000:
         warmup, iters = 1, 3
     for _ in range(warmup):
@@ -65,7 +74,7 @@ def time_ms(fn, warmup, iters):
         times.append(start.elapsed_time(end))
     times.sort()
     q = lambda p: times[min(len(times) - 1, int(p * len(times)))]
-    return statistics.median(times), q(0.2), q(0.8)
+    return statistics.median(times), q(0.2), q(0.8), extra_mib
 
 
 def git_rev():
@@ -98,7 +107,7 @@ def main():
     dtypes = {"fp16": torch.float16, "fp32": torch.float32}
 
     fields = ["impl", "dtype", "B", "H", "N", "D", "ms_median", "ms_p20", "ms_p80",
-              "tflops", "status", "gpu", "torch", "cuda", "git_rev", "time"]
+              "tflops", "extra_mem_MiB", "status", "gpu", "torch", "cuda", "git_rev", "time"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -121,11 +130,12 @@ def main():
                             row["status"] = "skipped_S_too_big"
                         else:
                             try:
-                                med, p20, p80 = time_ms(lambda: ALL[name](q, k, v),
+                                med, p20, p80, mem = time_ms(lambda: ALL[name](q, k, v),
                                                         args.warmup, args.iters)
                                 row.update(ms_median=f"{med:.4f}", ms_p20=f"{p20:.4f}",
                                            ms_p80=f"{p80:.4f}",
                                            tflops=f"{flops / (med * 1e-3) / 1e12:.2f}",
+                                           extra_mem_MiB=f"{mem:.1f}",
                                            status="ok")
                             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                                 row["status"] = f"error:{type(e).__name__}"
@@ -134,7 +144,8 @@ def main():
                         f.flush()
                         print(f"{name:13s} {dname} N={N:6d} D={D:3d} "
                               f"{row.get('ms_median', '-'):>10s} ms  "
-                              f"{row.get('tflops', '-'):>7s} TFLOP/s  {row['status']}")
+                              f"{row.get('tflops', '-'):>7s} TFLOP/s  "
+                              f"{row.get('extra_mem_MiB', '-'):>9s} MiB  {row['status']}")
                     del q, k, v
                     torch.cuda.empty_cache()
     print(f"wrote {out}")
