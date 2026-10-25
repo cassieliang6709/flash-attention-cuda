@@ -132,8 +132,7 @@ torch::Tensor fa1_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
   auto l_buf = torch::zeros({BH, N}, f32);
   auto m_buf = torch::full({BH, N}, -INFINITY, f32);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "fa1_forward", [&] {
-    using T = typename cuda_type<scalar_t>::type;
+  DISPATCH_FLOAT_HALF(q.scalar_type(), T, [&] {
     DISPATCH_HEAD_DIM(d, D, [&] {
       const size_t smem = (size_t)(BR + 2 * BC) * D * sizeof(float);
       auto kernel = fa1_kernel<T, D>;

@@ -91,8 +91,7 @@ torch::Tensor naive_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
   auto s = torch::empty({BH, N, N}, q.options().dtype(torch::kFloat));
   const float scale = 1.0f / std::sqrt((float)d);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "naive_forward", [&] {
-    using T = typename cuda_type<scalar_t>::type;
+  DISPATCH_FLOAT_HALF(q.scalar_type(), T, [&] {
     DISPATCH_HEAD_DIM(d, D, [&] {
       const T* Q = reinterpret_cast<const T*>(q.data_ptr());
       const T* K = reinterpret_cast<const T*>(k.data_ptr());

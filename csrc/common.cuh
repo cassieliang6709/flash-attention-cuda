@@ -46,12 +46,22 @@ __device__ __forceinline__ float from_float<float>(float x) { return x; }
 template <>
 __device__ __forceinline__ __half from_float<__half>(float x) { return __float2half(x); }
 
-// torch's at::Half and CUDA's __half have the same bit layout; kernels use
-// __half so the intrinsics above apply.
-template <typename T>
-struct cuda_type { using type = T; };
-template <>
-struct cuda_type<at::Half> { using type = __half; };
+// Dispatch dtype to the CUDA element type T: float or __half only.
+// (AT_DISPATCH_FLOATING_TYPES_AND_HALF would also instantiate double, which
+// from_float has no specialisation for.) torch's at::Half and CUDA's __half
+// have the same bit layout, so data_ptr() can be reinterpret_cast to T*.
+#define DISPATCH_FLOAT_HALF(dtype, T, ...)                          \
+  [&] {                                                             \
+    if ((dtype) == at::kFloat) {                                    \
+      using T = float;                                              \
+      return __VA_ARGS__();                                         \
+    } else if ((dtype) == at::kHalf) {                              \
+      using T = __half;                                             \
+      return __VA_ARGS__();                                         \
+    } else {                                                        \
+      TORCH_CHECK(false, "only float32 and float16 are supported"); \
+    }                                                               \
+  }()
 
 // Dispatch head_dim at compile time: the kernels keep D-sized arrays in
 // registers / shared memory, so D must be a template parameter.

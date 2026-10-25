@@ -114,8 +114,7 @@ torch::Tensor fa2_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
   const float scale = 1.0f / std::sqrt((float)d);
   auto o = torch::zeros_like(q);  // zeros so an unfinished kernel fails the tests loudly
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "fa2_forward", [&] {
-    using T = typename cuda_type<scalar_t>::type;
+  DISPATCH_FLOAT_HALF(q.scalar_type(), T, [&] {
     DISPATCH_HEAD_DIM(d, D, [&] {
       const size_t smem = (size_t)(BR + 2 * BC) * D * sizeof(float);
       auto kernel = fa2_kernel<T, D>;
