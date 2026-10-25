@@ -14,7 +14,7 @@
 | FA v2b（WMMA tensor core） | 未开始，等 ncu 确认 v2a 的瓶颈再做 | — | — |
 
 精度测试：RTX 4090 上 `pytest tests/` 结果为 27 passed（`results/pytest_4090.txt`）。
-Nsight Compute：**还没有数据**。AutoDL 的容器读不到性能计数器（`ERR_NVGPUCTRPERM`），下面的瓶颈判断都是 roofline **推算**，不是 ncu 实测。
+Nsight Compute：**还没有数据**。试过的两台机器都读不到性能计数器（`ERR_NVGPUCTRPERM`）：AutoDL 的 4090 容器，以及 lium 的 2×4090 pod（宿主机设置了 `RmProfilingAdminOnly: 1`，容器里的 root 改不了）。所以下面的瓶颈判断用的是 roofline **推算**和按 CUDA 规则**计算**出的 occupancy，都不是 ncu 实测。
 
 范围：只做前向，non-causal，输入 `[B, H, N, D]`，`D ∈ {64, 128}`，fp32 / fp16。
 
@@ -156,8 +156,24 @@ fp16，D = 64，额外显存（[B] 的 `extra_mem_MiB`，即调用期间峰值�
 
 **结论：** 三个自己写的 kernel 既不是 memory bound，也不是 compute bound，而是 **latency / occupancy bound**。所以下一步不该先去省字节，而是先让 SM 忙起来。SDPA 在 N ≥ 4096 时能达到 99–100 % 的 tensor 峰值，说明 4090 上这个问题的天花板确实是 tensor core。SDPA 有几行略超过 100 %，是因为实际 boost 频率高于白皮书的标称值；`env_4090.txt` 里记录的最高 SM 频率是 3105 MHz。
 
-fa2 达不到峰值，可能的原因如下。**这些都是推测，要等 ncu 验证：**
-1. **每个 block 只有 1 个 warp（32 线程）。** 同时每个 block 要用 24 KB（D = 64）或 48 KB（D = 128）SMEM，一个 SM 上同时驻留的 warp 很少，延迟藏不住。
+### 理论 occupancy（按 CUDA 规则计算，不是 ncu）
+
+计算的输入有三部分：
+- 每个 kernel 的寄存器数，用 `cuobjdump --dump-resource-usage` 读出：fa1 D=64 是 180，D=128 是 56；fa2 D=64 是 160，D=128 是 241–254。
+- 每个 block 的动态 SMEM：(Br + 2·Bc)·D·4 B，再加上 sm_80 之后每个 block 由系统保留的 1 KB。
+- 设备属性，在 lium 的 4090 上用 `torch.cuda.get_device_properties` 读出：128 个 SM；每个 SM 最多 1536 线程（48 个 warp）、65536 个寄存器、102400 B SMEM。另外 sm_89 每个 SM 最多驻留 24 个 block。
+
+| kernel | 每 block SMEM | 受 SMEM 限制的 block/SM | 受寄存器限制的 block/SM | 驻留 warp/SM | 理论 occupancy |
+|---|---|---|---|---|---|
+| fa2, D=64 | 25 KB | **4** | 12 | 4 / 48 | **8.3 %** |
+| fa2, D=128 | 49 KB | **2** | 8 | 2 / 48 | **4.2 %** |
+| fa1, D=64 | 25 KB | 4 | 11 | 网格只有 B·H = 128 个 block → 每个 SM 最多 1 个 | ≤ 2.1 % |
+| fa1, D=128 | 49 KB | 2 | 36（block 上限 24） | 网格只有 64 个 block → 一半 SM 空闲 | ≤ 2.1 %（只在 64 个 SM 上） |
+
+起限制作用的是 **SMEM**，不是寄存器：每个 block 只有 1 个 warp，却要占 25–49 KB SMEM，所以一个 SM 只能放 2–4 个 warp。naive 的 kernel 每个 block 有 256 线程，SMEM 也很小，occupancy 高得多，这和「D = 128 时 naive 比 fa2 快」的现象一致。实际达到的 occupancy 和 stall reasons 仍然要等 ncu 来测。
+
+fa2 达不到峰值，可能的原因如下。第 1 条已经由上面的 occupancy 计算支持；第 2 条是从地址算出来的；第 3 条是寄存器数的事实。**它们各自对耗时贡献多少，要等 ncu 来量化：**
+1. **每个 block 只有 1 个 warp（32 线程），而且 SMEM 用量大。** 一个 SM 只能驻留 2–4 个 warp（理论 occupancy 4.2–8.3 %），延迟藏不住。
 2. **`Qs[tx * D + d]` 有 32-way bank conflict。** 这一条是从地址算出来的，不是猜的：D 是 32 的倍数，同一个 warp 里所有线程在同一个 d 上访问的是同一个 bank 的不同地址。（`Ks`、`Vs` 所有线程读同一个地址，是广播，没有冲突。）
 3. **D = 128 时每个线程用 241–254 个寄存器。** 这进一步限制了 occupancy，也能解释为什么 D = 128 时 fa2 反而比 naive 慢。
 
@@ -166,16 +182,16 @@ fa2 达不到峰值，可能的原因如下。**这些都是推测，要等 ncu 
 - **v2a 在 D = 128 时比 naive 慢**（naive / fa2 = 0.60–0.64×，[B]）。原因见上面第 1 和第 3 条。这说明「融合」本身并不保证更快：如果 kernel 的 occupancy 很差，省下来的 HBM 流量换不回时间。
 - **v2a 比 cuBLAS 版的 torch_naive 还慢 3.3–14×，比 SDPA 慢 45–131×。** 标量 FMA 版本的上限是 82.6 TFLOP/s，而实际只达到了 1.4–2.9 %。和 torch_naive 比，fusion 能省下的 HBM 流量远远抵不上我们在计算上的劣势。
 - **v1 比 naive 还慢**（fa1 在所有形状下都慢于 naive，[B]）。§3 的估算已经预料到了：Bc = 32、O 用 fp32 时，v1 的 O 流量和 naive 的 S 流量同一量级。再加上 grid 只有 B·H = 128 或 64 个 block，每个 block 只有 1 个 warp，SM 也没占满。
-- **ncu 在 AutoDL 上用不了**（`ERR_NVGPUCTRPERM`），所以上面的瓶颈判断还只是推算。
+- **ncu 在 AutoDL 和 lium 的普通 pod 上都用不了**（`ERR_NVGPUCTRPERM`），所以上面的瓶颈判断还只是推算和计算。
 
 ## 下一步
 
-1. 在 lium 的 profiling 机器上跑 `profile/ncu.sh fa1 4096 64` 和 `fa2 4096 64`，用 SpeedOfLight、occupancy、bank conflict 计数和 stall reasons 验证上面三条推测。
+1. 在 lium 上**打开「GPU Profiling (ncu)」筛选**后租一台机器（这次租的 2×4090 没有这个标记，`RmProfilingAdminOnly: 1`）。先跑 `scripts/gpu_smoke.sh`，确认能读到计数器，再跑 `profile/ncu.sh fa1 4096 64` 和 `fa2 4096 64`，用 SpeedOfLight、achieved occupancy、bank conflict 计数和 stall reasons 验证上面三条推测。
 2. 按 ncu 指出的方向改 v2：每个 block 放 4 个 warp，SMEM 加 padding（`D + 1`），然后做 v2b（WMMA）。
 
 ## 简历描述
 
-> 从零用 CUDA 实现 FlashAttention 前向（naive / v1 / v2，PyTorch C++ extension），fp32 / fp16 与 fp64 参考对齐，fp16 误差与 PyTorch SDPA 持平（0.98–1.00×）。v2 交换 Q 与 K/V 的循环顺序，O 留在寄存器里，并按序列维度并行，在 RTX 4090 上比 v1 快 2.4–4.0×。N = 4096 时额外显存比 naive attention 少 129×（64 MiB vs 8.1 GiB），能跑到 N = 16k，而 naive 在 N ≥ 8k 时会超出显存。用 roofline 推算定位出标量版本属于 occupancy / latency bound（只达到 FP32 峰值的 1.4–2.9 %），作为下一步做 tensor core 版本的依据。
+> 从零用 CUDA 实现 FlashAttention 前向（naive / v1 / v2，PyTorch C++ extension），fp32 / fp16 与 fp64 参考对齐，fp16 误差与 PyTorch SDPA 持平（0.98–1.00×）。v2 交换 Q 与 K/V 的循环顺序，O 留在寄存器里，并按序列维度并行，在 RTX 4090 上比 v1 快 2.4–4.0×。N = 4096 时额外显存比 naive attention 少 129×（64 MiB vs 8.1 GiB），能跑到 N = 16k，而 naive 在 N ≥ 8k 时会超出显存。通过 roofline 推算和 occupancy 计算，定位出标量版本属于 occupancy / latency bound：只达到 FP32 峰值的 1.4–2.9 %，SMEM 限制使理论 occupancy 只有 4–8 %。这作为下一步做 tensor core 版本的依据。
 
 每个数字的来源：
 - 「0.98–1.00×」：[A] 中 fp16 行的 `ratio_to_sdpa`。
@@ -183,5 +199,6 @@ fa2 达不到峰值，可能的原因如下。**这些都是推测，要等 ncu 
 - 「129×、64 MiB vs 8.1 GiB」：[B] 中 `fp16,4,32,4096,64` 的 `extra_mem_MiB`，fa2 是 64，naive 是 8256。
 - 「N ≥ 8k 超出显存」：按 4·32·N²·4 B 计算，N = 8192 时是 32 GiB，大于 24 GB。[B] 中对应的行标记为 `skipped_S_too_big`。
 - 「1.4–2.9 %」：[R] 中 fa2 行的 `pct_peak_flops`。
+- 「理论 occupancy 4–8 %」：本 README「理论 occupancy」一节的计算，fa2 在 D=128 时是 4.2 %，D=64 时是 8.3 %。
 
 **注意：** 这条描述里没有写「比 SDPA 快」，也没有写「ncu 分析」，因为现在既没有这样的数据，事实上也不成立。等 lium 上的 ncu 数据补齐之后，再把「roofline 推算」改成「ncu 分析」。
