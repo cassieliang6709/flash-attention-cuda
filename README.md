@@ -188,17 +188,3 @@ fa2 达不到峰值，可能的原因如下。第 1 条已经由上面的 occupa
 
 1. 在 lium 上**打开「GPU Profiling (ncu)」筛选**后租一台机器（这次租的 2×4090 没有这个标记，`RmProfilingAdminOnly: 1`）。先跑 `scripts/gpu_smoke.sh`，确认能读到计数器，再跑 `profile/ncu.sh fa1 4096 64` 和 `fa2 4096 64`，用 SpeedOfLight、achieved occupancy、bank conflict 计数和 stall reasons 验证上面三条推测。
 2. 按 ncu 指出的方向改 v2：每个 block 放 4 个 warp，SMEM 加 padding（`D + 1`），然后做 v2b（WMMA）。
-
-## 简历描述
-
-> 从零用 CUDA 实现 FlashAttention 前向（naive / v1 / v2，PyTorch C++ extension），fp32 / fp16 与 fp64 参考对齐，fp16 误差与 PyTorch SDPA 持平（0.98–1.00×）。v2 交换 Q 与 K/V 的循环顺序，O 留在寄存器里，并按序列维度并行，在 RTX 4090 上比 v1 快 2.4–4.0×。N = 4096 时额外显存比 naive attention 少 129×（64 MiB vs 8.1 GiB），能跑到 N = 16k，而 naive 在 N ≥ 8k 时会超出显存。通过 roofline 推算和 occupancy 计算，定位出标量版本属于 occupancy / latency bound：只达到 FP32 峰值的 1.4–2.9 %，SMEM 限制使理论 occupancy 只有 4–8 %。这作为下一步做 tensor core 版本的依据。
-
-每个数字的来源：
-- 「0.98–1.00×」：[A] 中 fp16 行的 `ratio_to_sdpa`。
-- 「2.4–4.0×」：[B] 中 fa1 / fa2 的 `ms_median` 之比，在所有 dtype、D、N 下的范围是 2.38–3.98。
-- 「129×、64 MiB vs 8.1 GiB」：[B] 中 `fp16,4,32,4096,64` 的 `extra_mem_MiB`，fa2 是 64，naive 是 8256。
-- 「N ≥ 8k 超出显存」：按 4·32·N²·4 B 计算，N = 8192 时是 32 GiB，大于 24 GB。[B] 中对应的行标记为 `skipped_S_too_big`。
-- 「1.4–2.9 %」：[R] 中 fa2 行的 `pct_peak_flops`。
-- 「理论 occupancy 4–8 %」：本 README「理论 occupancy」一节的计算，fa2 在 D=128 时是 4.2 %，D=64 时是 8.3 %。
-
-**注意：** 这条描述里没有写「比 SDPA 快」，也没有写「ncu 分析」，因为现在既没有这样的数据，事实上也不成立。等 lium 上的 ncu 数据补齐之后，再把「roofline 推算」改成「ncu 分析」。
