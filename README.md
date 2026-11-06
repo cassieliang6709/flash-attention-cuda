@@ -14,7 +14,7 @@
 | FA v2b（WMMA tensor core） | 未开始，等 ncu 确认 v2a 的瓶颈再做 | — | — |
 
 精度测试：RTX 4090 上 `pytest tests/` 结果为 27 passed（`results/pytest_4090.txt`）。
-Nsight Compute：**还没有数据**。试过的两台机器都读不到性能计数器（`ERR_NVGPUCTRPERM`）：AutoDL 的 4090 容器，以及 lium 的 2×4090 pod（宿主机设置了 `RmProfilingAdminOnly: 1`，容器里的 root 改不了）。所以下面的瓶颈判断用的是 roofline **推算**和按 CUDA 规则**计算**出的 occupancy，都不是 ncu 实测。
+Nsight Compute：**已在课题组的 RTX 4090 上实测**（`results/ncu/`，环境见 `results/env_rtx5_wbn2.txt`），见「Nsight Compute 实测」一节。之前 AutoDL 的 4090 容器和 lium 的 2×4090 pod 都读不到性能计数器（`ERR_NVGPUCTRPERM`，宿主机设置了 `RmProfilingAdminOnly: 1`，容器没有 `CAP_SYS_ADMIN`）。
 
 范围：只做前向，non-causal，输入 `[B, H, N, D]`，`D ∈ {64, 128}`，fp32 / fp16。
 
@@ -22,6 +22,7 @@ Nsight Compute：**还没有数据**。试过的两台机器都读不到性能�
 
 ```bash
 # 0. 新租的机器上先跑这个（不到 1 分钟）；ncu 没权限就换机器
+#    自己建 docker 容器时要加 --cap-add SYS_ADMIN，否则宿主机 RmProfilingAdminOnly=1 时读不到计数器
 bash scripts/gpu_smoke.sh
 
 # 1. 编译（8.9 = 4090，9.0 = H100）
@@ -170,21 +171,45 @@ fp16，D = 64，额外显存（[B] 的 `extra_mem_MiB`，即调用期间峰值�
 | fa1, D=64 | 25 KB | 4 | 11 | 网格只有 B·H = 128 个 block → 每个 SM 最多 1 个 | ≤ 2.1 % |
 | fa1, D=128 | 49 KB | 2 | 36（block 上限 24） | 网格只有 64 个 block → 一半 SM 空闲 | ≤ 2.1 %（只在 64 个 SM 上） |
 
-起限制作用的是 **SMEM**，不是寄存器：每个 block 只有 1 个 warp，却要占 25–49 KB SMEM，所以一个 SM 只能放 2–4 个 warp。naive 的 kernel 每个 block 有 256 线程，SMEM 也很小，occupancy 高得多，这和「D = 128 时 naive 比 fa2 快」的现象一致。实际达到的 occupancy 和 stall reasons 仍然要等 ncu 来测。
+起限制作用的是 **SMEM**，不是寄存器：每个 block 只有 1 个 warp，却要占 25–49 KB SMEM，所以一个 SM 只能放 2–4 个 warp。naive 的 kernel 每个 block 有 256 线程，SMEM 也很小，occupancy 高得多，这和「D = 128 时 naive 比 fa2 快」的现象一致。下面一节的 ncu 实测证实了 D = 64 的这两行。
 
-fa2 达不到峰值，可能的原因如下。第 1 条已经由上面的 occupancy 计算支持；第 2 条是从地址算出来的；第 3 条是寄存器数的事实。**它们各自对耗时贡献多少，要等 ncu 来量化：**
-1. **每个 block 只有 1 个 warp（32 线程），而且 SMEM 用量大。** 一个 SM 只能驻留 2–4 个 warp（理论 occupancy 4.2–8.3 %），延迟藏不住。
-2. **`Qs[tx * D + d]` 有 32-way bank conflict。** 这一条是从地址算出来的，不是猜的：D 是 32 的倍数，同一个 warp 里所有线程在同一个 d 上访问的是同一个 bank 的不同地址。（`Ks`、`Vs` 所有线程读同一个地址，是广播，没有冲突。）
-3. **D = 128 时每个线程用 241–254 个寄存器。** 这进一步限制了 occupancy，也能解释为什么 D = 128 时 fa2 反而比 naive 慢。
+### Nsight Compute 实测（fp16，N = 4096，D = 64）
+
+环境：RTX 4090，驱动 610.43，CUDA 13.0，ncu 2025.3.1，torch 2.9.1+cu130（`results/env_rtx5_wbn2.txt`）。命令：`bash profile/ncu.sh <impl> 4096 64 fp16`，`--set full`。
+
+文件缩写：**[N]** = `results/ncu/<impl>_N4096_D64_fp16.{raw,details}.csv`（`.ncu-rep` 可在 Mac 的 Nsight Compute GUI 里打开）。
+
+> ncu 默认锁频（SM 2.23 GHz）并对每个 kernel 做多次 replay，所以下表的耗时**不能**和 [B] 的 benchmark 耗时直接比，只用来看 kernel 之间的相对比例和利用率。
+
+| kernel | ncu 耗时 (ms) | SM % | Memory % | DRAM 读 / 写 | 寄存器 | block | 理论 / 实测 occupancy | SMEM bank conflict |
+|---|---|---|---|---|---|---|---|---|
+| naive_scores | 272.7 | 22.5 | **99.7** | 0.14 / 8.56 GB | 30 | 256 | 100 / 78.9 % | 0 |
+| naive_softmax | 18.8 | 19.4 | **92.6** | 8.59 / 8.56 GB | 22 | 256 | 100 / 94.2 % | 0.9 M |
+| naive_pv | 60.2 | 99.8 | **99.8** | 8.66 / 0.07 GB | 37 | 256 | 100 / 98.5 % | 0 |
+| fa1 | 801.7 | 3.3 | 20.7 | 26.4 / 17.7 GB | 180 | 32 | 8.3 / **2.1 %** | 30.1 G |
+| fa2 (v2a) | 288.4 | 9.1 | 47.6 | 0.20 / 0.05 GB | 158 | 32 | 8.3 / **8.3 %** | 30.1 G（平均 **12-way**） |
+
+结论（都来自 [N]）：
+1. **naive 是 memory bound**，证实了 §1 的推算：三个 kernel 的 Memory % 都在 92.6–99.8 %，S 来回 HBM 一共约 34 GB。
+2. **fa2 把 DRAM 流量从约 34 GB 降到约 0.25 GB**（fusion 生效，K/V 被 L2 接住，§4 的预期成立），但 SM 9.1 %、Memory 47.6 %，两边都没饱和，ncu 的 SOLBottleneck 规则判定为 **latency bound**。
+3. **occupancy 实测 8.33 %，等于理论值**，ncu 报告限制因素是 SMEM（每个 scheduler 只有 1 个 warp，硬件上限 12）。平均每 15.1 cycle 才发射 1 条指令，最大的 stall 是等 L1TEX 的 scoreboard 依赖（6.2 cycle/指令）。
+4. **SMEM bank conflict 平均 12-way**：30.1 G 次冲突，占全部 shared wavefront 的 77.8 %。方向和地址推算一致（`Qs[tx * D + d]` 按 D 跨步），但实测平均是 12-way，不是推算的 32-way，因为不是每条 shared load 都是这种访问。
+5. **fa1 的 occupancy 只有 2.1 %**：grid 只有 B·H = 128 个 block，每个 SM 最多 1 个 warp；DRAM 读写 44 GB，比 naive 还多，解释了「v1 比 naive 慢」。
+6. fa2 的 FP32 只用到峰值的 3 %（ncu SOLFPRoofline）。
+
+D = 128 的第 3 条原因（每线程 241–254 个寄存器）还没有用 ncu 测。
 
 ## 负面结果
 
 - **v2a 在 D = 128 时比 naive 慢**（naive / fa2 = 0.60–0.64×，[B]）。原因见上面第 1 和第 3 条。这说明「融合」本身并不保证更快：如果 kernel 的 occupancy 很差，省下来的 HBM 流量换不回时间。
 - **v2a 比 cuBLAS 版的 torch_naive 还慢 3.3–14×，比 SDPA 慢 45–131×。** 标量 FMA 版本的上限是 82.6 TFLOP/s，而实际只达到了 1.4–2.9 %。和 torch_naive 比，fusion 能省下的 HBM 流量远远抵不上我们在计算上的劣势。
 - **v1 比 naive 还慢**（fa1 在所有形状下都慢于 naive，[B]）。§3 的估算已经预料到了：Bc = 32、O 用 fp32 时，v1 的 O 流量和 naive 的 S 流量同一量级。再加上 grid 只有 B·H = 128 或 64 个 block，每个 block 只有 1 个 warp，SM 也没占满。
-- **ncu 在 AutoDL 和 lium 的普通 pod 上都用不了**（`ERR_NVGPUCTRPERM`），所以上面的瓶颈判断还只是推算和计算。
+- **ncu 在 AutoDL 和 lium 的普通 pod 上都用不了**（`ERR_NVGPUCTRPERM`）。最后是在自己建的、带 `--cap-add SYS_ADMIN` 的 docker 容器里测到的。
 
 ## 下一步
 
-1. 在 lium 上**打开「GPU Profiling (ncu)」筛选**后租一台机器（这次租的 2×4090 没有这个标记，`RmProfilingAdminOnly: 1`）。先跑 `scripts/gpu_smoke.sh`，确认能读到计数器，再跑 `profile/ncu.sh fa1 4096 64` 和 `fa2 4096 64`，用 SpeedOfLight、achieved occupancy、bank conflict 计数和 stall reasons 验证上面三条推测。
-2. 按 ncu 指出的方向改 v2：每个 block 放 4 个 warp，SMEM 加 padding（`D + 1`），然后做 v2b（WMMA）。
+按「Nsight Compute 实测」的结论排序，每改一步都重跑 `profile/ncu.sh fa2 4096 64` 对比：
+1. **消除 SMEM bank conflict**：`Qs` 加 padding（行宽 `D + 1`）或 swizzle，目标是 conflict 降到接近 0。
+2. **提高 occupancy**：每个 block 放 4 个 warp，同时压低 SMEM 和寄存器（现在 158 个/线程），目标是 achieved occupancy 明显高于 8.3 %。
+3. **v2b（WMMA tensor core）**：现在 FP32 只用到峰值的 3 %，天花板是 tensor core。
+4. 补测 D = 128 的 ncu，验证寄存器压力那一条。

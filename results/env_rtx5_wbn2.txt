@@ -1,0 +1,12 @@
+ncu 实测环境（2026-10-26）
+
+机器：课题组 rtx5，容器 wbn2（docker，--gpus device=1，--cap-add SYS_ADMIN）
+GPU：NVIDIA GeForce RTX 4090 24 GB（宿主机 GPU1，Bus 00000000:AF:00.0），sm_89
+驱动：610.43.02（宿主机 RmProfilingAdminOnly: 1，靠容器的 CAP_SYS_ADMIN 读计数器）
+CUDA toolkit：13.0（nvcc V13.0.88），从 nvidia/cuda:13.0.1-devel-ubuntu22.04 镜像拷入
+Nsight Compute：2025.3.1.0 (build 36398880)
+torch：2.9.1+cu130（2.14 要求 C++20，和 setup.py 的 -std=c++17 冲突，所以降级）
+Python 3.10.6，Ubuntu 22.04
+ncu 下的时钟：SM 2.23 GHz，DRAM 10.24 GHz（ncu 默认锁频，耗时不能和 bench 的耗时直接比）
+pytest tests/：27 passed
+命令：bash profile/ncu.sh {naive,fa1,fa2} 4096 64 fp16
